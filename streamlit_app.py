@@ -59,10 +59,10 @@ def column_config_from_types(col_types: Dict[str, str]) -> Dict[str, st.column_c
             cfg[c] = st.column_config.TextColumn()
         elif any(x in T for x in ["NUMBER", "DECIMAL", "INT", "FLOAT", "DOUBLE"]):
             cfg[c] = st.column_config.NumberColumn()
-        elif any(x in T for x in ["DATE"]):
-            cfg[c] = st.column_config.DateColumn()
         elif any(x in T for x in ["TIMESTAMP", "DATETIME"]):
             cfg[c] = st.column_config.DatetimeColumn()
+        elif any(x in T for x in ["DATE"]):
+            cfg[c] = st.column_config.DateColumn()
         elif "BOOLEAN" in T:
             cfg[c] = st.column_config.SelectboxColumn(
                 options=[None, True, False],
@@ -354,29 +354,71 @@ def stage_csv_into_working(working: pd.DataFrame, base_cols: List[str], incoming
     return out
 
 def safe_replace(session: Session, database: str, schema: str, table_name: str, df: pd.DataFrame) -> None:
-    temp = f"{table_name}__staging_{int(time.time())}"
-    fq_temp = f"{database}.{schema}.{temp}"
-    fq_real = f"{database}.{schema}.{table_name}"
+    """
+    Replace the contents of a Snowflake table in-place using a transient staging table.
+    - Uses DELETE + INSERT inside a transaction.
+    - Leaves the staging table intact if the transaction fails.
+    - Raises a ValueError if dropping the staging table fails after success.
+    """
+    if df.empty:
+        raise ValueError("Refusing to overwrite table with 0 rows.")
+    clean = df.drop(columns=["__rowid", "_delete_flag", "_upsert_type"], errors="ignore")
+    if clean.empty:
+        raise ValueError("Refusing to overwrite table with 0 rows.")
 
-    session.sql(f"CREATE TEMP TABLE {fq_temp} LIKE {fq_real}").collect()
+    real_table_fqn = f'"{database}"."{schema}"."{table_name}"'
+    staging_table_name = f'{table_name}__staging_{int(time.time())}'
+    staging_table_fqn = f'"{database}"."{schema}"."{staging_table_name}"'
+
+    # 1 Create a transient staging table
+    session.sql(f'CREATE OR REPLACE TRANSIENT TABLE {staging_table_fqn} LIKE {real_table_fqn}').collect()
+
+    # 2 Load data into the staging table
     session.write_pandas(
-        df=df,
-        table_name=temp,
+        df=clean,
+        table_name=staging_table_name,
         database=database,
         schema=schema,
         overwrite=False,
-        quote_identifiers=False
+        quote_identifiers=True,
     )
+
+    # 3 Verify that the staging table isn't empty
+    row_count = session.sql(f'SELECT COUNT(*) AS C FROM {staging_table_fqn}').collect()[0]["C"]
+    if int(row_count) == 0:
+        stg_table_hint = f"\nStaging table preserved for inspection: {staging_table_fqn}"
+        raise ValueError("Refusing to replace table with 0 rows (staging is empty. {stg_table_hint}).")
+
+    # Discover real columns and fix order
+    cols_rows = session.sql(f'DESCRIBE TABLE {real_table_fqn}').collect()
+    real_columns = [r["name"] for r in cols_rows if r["kind"] == "COLUMN"]
+    col_list = ", ".join(f'"{c}"' for c in real_columns)
+    # 4 Perform the in-place replace inside a transaction
     session.sql("BEGIN").collect()
     try:
-        session.sql(f"DELETE FROM {fq_real}").collect()
-        session.sql(f"INSERT INTO {fq_real} SELECT * FROM {fq_temp}").collect()
+        session.sql(f'DELETE FROM {real_table_fqn}').collect()
+
+        session.sql(
+            f'INSERT INTO {real_table_fqn} ({col_list}) SELECT {col_list} FROM {staging_table_fqn}'
+        ).collect()
+
         session.sql("COMMIT").collect()
-    except Exception:
+        transaction_succeeded = True
+    except Exception as err:
         session.sql("ROLLBACK").collect()
-        raise
+        transaction_succeeded = False
+        stg_table_hint = f"\nStaging table preserved for inspection: {staging_table_fqn}"
+        raise ValueError(f"Error replacing table: {err}{stg_table_hint}") from err
 
-
+    # 5 Cleanup only if the transaction succeeded
+    if transaction_succeeded:
+        try:
+            session.sql(f'DROP TABLE {staging_table_fqn}').collect()
+        except Exception as drop_err:
+            # Escalate as ValueError so user sees it clearly
+            raise ValueError(
+                f"Replace succeeded, but failed to drop staging table {staging_table_fqn}: {drop_err}"
+            ) from drop_err
 
 def revert_table_by_offset_minutes(session: Session, table_fqn: str, minutes: int) -> None:
     session.sql("BEGIN").collect()
@@ -390,7 +432,6 @@ def revert_table_by_offset_minutes(session: Session, table_fqn: str, minutes: in
     ).collect()
     session.sql("COMMIT").collect()
 
-
 def revert_table_to_timestamp(session: Session, table_fqn: str, ts_utc: str) -> None:
     session.sql("BEGIN").collect()
     session.sql(f"DELETE FROM {table_fqn}").collect()
@@ -402,7 +443,6 @@ def revert_table_to_timestamp(session: Session, table_fqn: str, ts_utc: str) -> 
         """
     ).collect()
     session.sql("COMMIT").collect()
-
 
 def reset_all() -> None:
     try:
@@ -439,6 +479,51 @@ def _row_changes_mask(base: pd.DataFrame, work: pd.DataFrame, cols: List[str]) -
     # Return a boolean mask aligned to the original work DataFrame
     return work["__rowid"].isin(changed_row_flags[changed_row_flags].index)
 
+def replace_string_nulls(value):
+        """Return pd.NA if the value is a string that represents a null."""
+        NULL_SENTINELS = {"", "null", "NULL", "NaN", "nan", "None"}
+        if isinstance(value, str):
+            stripped_value = value.strip()
+            if stripped_value in NULL_SENTINELS:
+                return pd.NA
+        return value
+
+def make_editor_friendly(df: pd.DataFrame, column_types: dict[str, str]) -> pd.DataFrame:
+    """
+    Convert string-based date and timestamp columns into real datetime-like objects
+    so Streamlit editors (DateColumn, DatetimeColumn) work correctly.
+    """
+    normalized_df = df.copy()
+
+    for column_name, snowflake_type in column_types.items():
+        if column_name not in normalized_df.columns:
+            continue
+
+        normalized_type_name = snowflake_type.upper().strip()
+        column_series = normalized_df[column_name]
+
+        # Replace common string representations of nulls with pd.NA
+        if column_series.dtype == object:
+            normalized_df[column_name] = column_series.map(replace_string_nulls)
+
+        # Convert TIMESTAMP or DATETIME columns to pandas datetime64[ns]
+        if normalized_type_name == "DATETIME" or normalized_type_name.startswith("TIMESTAMP"):
+            normalized_df[column_name] = pd.to_datetime(
+                normalized_df[column_name],
+                errors="coerce",
+                utc=False,
+            )
+
+        # Convert DATE columns to Python datetime.date
+        elif normalized_type_name == "DATE":
+            parsed_dates = pd.to_datetime(
+                normalized_df[column_name],
+                errors="coerce",
+                utc=False,
+            )
+            normalized_df[column_name] = parsed_dates.dt.date
+
+    return normalized_df
 
 # ---------- UI + State ----------
 
@@ -464,7 +549,7 @@ custom_column_config = column_config_from_types(col_types)
 merge_keys_raw: str = st.text_input("Key columns (optional, comma-separated)", value="")
 merge_keys: List[str] = [k.strip() for k in merge_keys_raw.split(",") if k.strip()]
 
-st.subheader("Optional: stage a CSV of new or updated rows")
+st.subheader("untested: stage a CSV of new or updated rows")
 csv = st.file_uploader("Choose a CSV to stage", type="csv")
 stage_btn = st.button("Stage CSV into editor", disabled=csv is None)
 
@@ -525,6 +610,7 @@ with c3:
         st.session_state["del_sel"] = set()
 
 view_df["_delete_flag"] = view_df["__rowid"].astype(np.int64).isin(st.session_state["del_sel"])
+view_df = make_editor_friendly(view_df, col_types)
 
 with st.expander("DEBUG — dtypes before editor", expanded=False):
     st.write(view_df.dtypes)  # check REVIEWED_DATE dtype
@@ -538,6 +624,7 @@ with st.expander("DEBUG — dtypes before editor", expanded=False):
     st.write("merge_keys:", merge_keys)
     st.write("Is REVIEWED_DATE in merge_keys? ", "REVIEWED_DATE" in merge_keys)
     st.write("Sample REVIEWED_DATE parse:", pd.to_datetime(view_df["REVIEWED_DATE"], errors="coerce").head(5))
+
 
 with st.form("editor_form", clear_on_submit=False):
     specials = {
