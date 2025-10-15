@@ -1,6 +1,6 @@
 from typing import Dict, List, Optional, Tuple, Set, Literal
-from snowflake.snowpark import Session
-import streamlit as st
+from snowflake.snowpark import Session # type: ignore
+import streamlit as st # type: ignore
 import time
 import pandas as pd
 from io import StringIO
@@ -47,9 +47,109 @@ def load_table_cached(table_fqn: str) -> pd.DataFrame:
 def column_config_from_types(col_types: Dict[str, str]) -> Dict[str, st.column_config.Column]:
     cfg: Dict[str, st.column_config.Column] = {}
     for c, t in col_types.items():
-        if "VARCHAR" in t.upper():
+        T = t.upper()
+
+        if c == "STATUS":
+            cfg[c] = st.column_config.SelectboxColumn(
+                options=["", "ACTIVE", "INACTIVE", "PENDING"],
+                # TODO: enforce these
+                help="Select the current record status",
+            )
+        elif "VARCHAR" in T:
             cfg[c] = st.column_config.TextColumn()
+        elif any(x in T for x in ["NUMBER", "DECIMAL", "INT", "FLOAT", "DOUBLE"]):
+            cfg[c] = st.column_config.NumberColumn()
+        elif any(x in T for x in ["DATE"]):
+            cfg[c] = st.column_config.DateColumn()
+        elif any(x in T for x in ["TIMESTAMP", "DATETIME"]):
+            cfg[c] = st.column_config.DatetimeColumn()
+        elif "BOOLEAN" in T:
+            cfg[c] = st.column_config.SelectboxColumn(
+                options=[None, True, False],
+                format_func=lambda x: "—" if x is None else str(x),
+                help="Select True or False (leave blank for NULL)",
+            )
     return cfg
+
+def is_blank(x) -> bool:
+    return x is None or (isinstance(x, str) and x.strip() == "")
+
+def normalize_boolean_value(v):
+    """Convert various user-entered values into True/False/NA."""
+    # If it's a true null (None, NaN, <NA>), leave it alone
+    if pd.isna(v):
+        return v
+
+    # Convert to string and strip whitespace for comparison
+    key = str(v).strip().lower()
+
+    truthy_values = {"true", "t", "1"}
+    falsy_values  = {"false", "f", "0"}
+
+    if key in truthy_values:
+        return True
+    elif key in falsy_values:
+        return False
+    else:
+        # If it’s not one of those, keep the original value (validation will catch it later)
+        return v
+
+
+def prepare_for_snowflake_with_validation(df: pd.DataFrame, col_types: dict[str, str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Normalize blanks, coerce to Snowflake-friendly dtypes, and collect coercion errors.
+    Returns: (coerced_df, errors_df[ row_index, column, value, reason ])
+    """
+    out = df.copy()
+    issues = []
+
+    for c, t in col_types.items():
+        if c not in out.columns:
+            continue
+        U = t.upper()
+        s = pd.Series(out[c], copy=True)
+
+        # Normalize blanks/None → pd.NA (for any dtype)
+        s = s.map(lambda x: pd.NA if (x is None or (isinstance(x, str) and x.strip() == "")) else x)
+        nonblank = ~s.isna()  # after normalization, this now covers everything
+
+
+        if "BOOLEAN" in U:
+            # Accept friendly inputs; everything else is an error
+            mapped = s.map(normalize_boolean_value)
+            bad = nonblank & ~mapped.isin([True, False])
+            out[c] = mapped.astype("boolean")
+            reason = "not a boolean (True/False)"
+
+        elif "DATE" in U:
+            coerced = pd.to_datetime(s, errors="coerce")
+            bad = nonblank & coerced.isna()
+            out[c] = coerced.dt.date
+            reason = "invalid date"
+
+        elif any(x in U for x in ["TIMESTAMP", "DATETIME"]):
+            coerced = pd.to_datetime(s, errors="coerce")
+            bad = nonblank & coerced.isna()
+            out[c] = coerced
+            reason = "invalid timestamp"
+
+        elif any(x in U for x in ["NUMBER", "DECIMAL", "INT", "FLOAT", "DOUBLE"]):
+            coerced = pd.to_numeric(s, errors="coerce")
+            bad = nonblank & coerced.isna()
+            out[c] = coerced
+            reason = "invalid number"
+
+        else:
+            # VARCHAR (and others) → string dtype with NA support
+            out[c] = pd.Series(s, dtype=pd.StringDtype(storage="python"))
+            bad = pd.Series(False, index=s.index)
+            reason = None
+
+        if bad.any():
+            for idx, val in df.loc[bad, c].items():
+                issues.append({"row_index": idx, "column": c, "value": val, "reason": reason})
+
+    return out, pd.DataFrame(issues)
 
 
 def ensure_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
@@ -90,9 +190,12 @@ def build_column_filters(df: pd.DataFrame) -> Dict[str, Tuple[str, Tuple]]:
                 pd.api.types.is_integer_dtype(s) 
                 and set(s.dropna().unique()).issubset({0, 1})
             ):
-                choice = st.selectbox(f"{c}", options=["All", "True", "False"], index=0, key=f"boolfilter:{c}")
+                choice = st.selectbox(f"{c}", options=["All", "True", "False", "Blank"], index=0, key=f"boolfilter:{c}")
                 if choice != "All":
-                    filters[c] = ("boolean", (choice == "True",))
+                    if choice == "Blank":
+                        filters[c] = ("boolean_blank", ())
+                    else:
+                        filters[c] = ("boolean", (choice == "True",))
 
             elif pd.api.types.is_numeric_dtype(s):
                 vals = pd.to_numeric(s, errors="coerce")
@@ -118,10 +221,10 @@ def build_column_filters(df: pd.DataFrame) -> Dict[str, Tuple[str, Tuple]]:
 
                 enabled = st.checkbox(f"Filter {c}", key=f"enable:{c}", value=False)
                 if enabled:
-                  dmin, dmax = sdt.min().date(), sdt.max().date()
-                  d1, d2 = st.date_input(f"{c}", value=(dmin, dmax), key=f"datefilter:{c}")
-                  include_blank = st.checkbox("Include blanks", value=True, key=f"blank:{c}")
-                  filters[c] = ("date_range", (d1, d2, include_blank))
+                    dmin, dmax = sdt.min().date(), sdt.max().date()
+                    d1, d2 = st.date_input(f"{c}", value=(dmin, dmax), key=f"datefilter:{c}")
+                    include_blank = st.checkbox("Include blanks", value=True, key=f"blank:{c}")
+                    filters[c] = ("date_range", (d1, d2, include_blank))
             else:
                 val = st.text_input(f"{c} contains", value="", key=f"strfilter:{c}")
                 if val:
@@ -166,7 +269,10 @@ def apply_filters(df: pd.DataFrame, filters: Dict[str, Tuple[str, Tuple]]) -> pd
     out = df.copy()
     for c, (ftype, args) in filters.items():
         if ftype == "boolean":
-            out = out[out[c].astype(bool) == bool(args[0])]
+            out = out[out[c].eq(bool(args[0]))]
+        elif ftype == "boolean_blank":
+            # Special case: keep only rows where value is null/NA
+            out = out[out[c].isna()]
         elif ftype == "numeric_range":
             lo, hi, include_blank = args
             ser = pd.to_numeric(out[c], errors="coerce")
@@ -247,19 +353,29 @@ def stage_csv_into_working(working: pd.DataFrame, base_cols: List[str], incoming
         out = pd.concat([working, inc], ignore_index=True, sort=False)
     return out
 
+def safe_replace(session: Session, database: str, schema: str, table_name: str, df: pd.DataFrame) -> None:
+    temp = f"{table_name}__staging_{int(time.time())}"
+    fq_temp = f"{database}.{schema}.{temp}"
+    fq_real = f"{database}.{schema}.{table_name}"
 
-def write_full_table(session: Session, database: str, schema: str, table_name: str, df: pd.DataFrame) -> None:
-    clean = df.drop(columns=AUX_COLS, errors="ignore")
-    if clean.empty:
-        raise ValueError("Refusing to overwrite table with 0 rows.")
+    session.sql(f"CREATE TEMP TABLE {fq_temp} LIKE {fq_real}").collect()
     session.write_pandas(
-        df=clean,
-        table_name=table_name,
+        df=df,
+        table_name=temp,
         database=database,
         schema=schema,
-        overwrite=True,
-        quote_identifiers=False,
+        overwrite=False,
+        quote_identifiers=False
     )
+    session.sql("BEGIN").collect()
+    try:
+        session.sql(f"DELETE FROM {fq_real}").collect()
+        session.sql(f"INSERT INTO {fq_real} SELECT * FROM {fq_temp}").collect()
+        session.sql("COMMIT").collect()
+    except Exception:
+        session.sql("ROLLBACK").collect()
+        raise
+
 
 
 def revert_table_by_offset_minutes(session: Session, table_fqn: str, minutes: int) -> None:
@@ -324,11 +440,7 @@ def _row_changes_mask(base: pd.DataFrame, work: pd.DataFrame, cols: List[str]) -
     return work["__rowid"].isin(changed_row_flags[changed_row_flags].index)
 
 
-
-
 # ---------- UI + State ----------
-
-
 
 if "data_version" not in st.session_state:
     st.session_state["data_version"] = 0
@@ -346,7 +458,8 @@ if "base_df" not in st.session_state or st.session_state.get("current_fqn") != t
     st.session_state["__next_neg_id"] = -1
 
 col_types = describe_table_cached(table_fqn)
-column_config = column_config_from_types(col_types)
+
+custom_column_config = column_config_from_types(col_types)
 
 merge_keys_raw: str = st.text_input("Key columns (optional, comma-separated)", value="")
 merge_keys: List[str] = [k.strip() for k in merge_keys_raw.split(",") if k.strip()]
@@ -413,7 +526,26 @@ with c3:
 
 view_df["_delete_flag"] = view_df["__rowid"].astype(np.int64).isin(st.session_state["del_sel"])
 
+with st.expander("DEBUG — dtypes before editor", expanded=False):
+    st.write(view_df.dtypes)  # check REVIEWED_DATE dtype
+    if "REVIEWED_DATE" in view_df.columns:
+        s = view_df["REVIEWED_DATE"]
+        st.write("head values:", s.head(10).tolist())
+        st.write("python types:", [type(x).__name__ for x in s.head(10)])
+        # is it datetime-like?
+        import pandas as pd
+        st.write("is datetime-like:", pd.api.types.is_datetime64_any_dtype(s) or all(hasattr(x, "year") for x in s.dropna().head(10)))
+    st.write("merge_keys:", merge_keys)
+    st.write("Is REVIEWED_DATE in merge_keys? ", "REVIEWED_DATE" in merge_keys)
+    st.write("Sample REVIEWED_DATE parse:", pd.to_datetime(view_df["REVIEWED_DATE"], errors="coerce").head(5))
+
 with st.form("editor_form", clear_on_submit=False):
+    specials = {
+        "__rowid": st.column_config.NumberColumn(disabled=True),
+        "_delete_flag": st.column_config.CheckboxColumn(),
+        "_upsert_type": st.column_config.SelectboxColumn(options=["Existing", "Update", "Insert"], disabled=True),
+    }
+    editor_config = {**custom_column_config, **specials}  # merge your generated config
     edited_view = st.data_editor(
         view_df,
         use_container_width=True,
@@ -421,11 +553,7 @@ with st.form("editor_form", clear_on_submit=False):
         hide_index=True,
         column_order=["__rowid", "_delete_flag", "_upsert_type"]
         + [c for c in view_df.columns if c not in ("__rowid", "_delete_flag", "_upsert_type")],
-        column_config={
-            "__rowid": st.column_config.NumberColumn(disabled=True),
-            "_delete_flag": st.column_config.CheckboxColumn(),
-            "_upsert_type": st.column_config.SelectboxColumn(options=["Existing", "Update", "Insert"], disabled=True),
-        },
+        column_config=editor_config,
         height=640,
         key="data_editor",
     )
@@ -492,11 +620,18 @@ if st.session_state.get("show_confirm", False) and "pending_write" in st.session
         with c1:
             if st.button("✅ Yes, apply changes"):
                 try:
-                    final_df = st.session_state["pending_write"]["final_candidate"]
-                    if final_df.empty:
+                    coerced_df, errors_df = prepare_for_snowflake_with_validation(st.session_state["working_df"], col_types)
+
+                    if not errors_df.empty:
+                        st.error("Some values can’t be converted. Fix these and try again.")
+                        st.dataframe(errors_df.head(200))  # show first 200
+                        st.stop()  # ⛔ fail fast in the UI
+
+                    # If we get here, it’s safe to proceed:
+                    if coerced_df.empty:
                         st.error("Refusing to overwrite table with 0 rows.")
                     else:
-                        write_full_table(session, database, schema, table_name, final_df)
+                        safe_replace(session, database, schema, table_name, coerced_df)
                         st.success("Table updated successfully.")
                         st.session_state.pop("pending_write", None)
                         st.session_state["show_confirm"] = False
